@@ -3,348 +3,222 @@ pragma solidity ^0.8.20;
 
 /**
  * @title VehicleOwnership
- * @author Vehicle Ownership Transfer Project
- * @notice Manages vehicle registration and ownership transfers on the blockchain.
- *         Each vehicle record is stored permanently and tamper-proof.
- *         Designed as a college mini-project — kept simple and readable.
+ * @dev Smart contract for managing vehicle registration, ownership transfer, and title history.
  */
 contract VehicleOwnership {
-
-    // -------------------------------------------------------------------------
-    // DATA STRUCTURES
-    // -------------------------------------------------------------------------
-
-    /**
-     * @dev Represents a single ownership record in the vehicle's history.
-     *      Every time ownership changes hands, one of these is pushed to the
-     *      vehicle's history array.
-     */
-    struct OwnershipRecord {
-        address owner;          // Wallet address of the owner at this point
-        uint256 timestamp;      // Block timestamp when the transfer happened
-    }
-
-    /**
-     * @dev Core vehicle data stored on-chain.
-     *      Sensitive personal documents (e.g. ID scans) are NOT stored here —
-     *      only the minimum information needed to prove ownership.
-     */
+    
+    // Struct representing vehicle details
     struct Vehicle {
-        uint256 vehicleId;          // Unique numeric ID assigned at registration
-        string  vehicleNumber;      // e.g. "MH12AB1234" — the license/plate number
-        string  vehicleModel;       // e.g. "Toyota Camry 2022"
-        address currentOwner;       // Wallet address of the current owner
-        uint256 registeredAt;       // Block timestamp when the vehicle was registered
-        bool    exists;             // Guard flag — lets us check if a vehicle exists
+        string vin;
+        string make;
+        string model;
+        uint256 year;
+        string licensePlate;
+        address currentOwner;
+        uint256 registrationTimestamp;
+        bool isRegistered;
     }
 
-    // -------------------------------------------------------------------------
-    // STATE VARIABLES
-    // -------------------------------------------------------------------------
+    // Struct representing an ownership transfer event log
+    struct TransferRecord {
+        address previousOwner;
+        address newOwner;
+        uint256 timestamp;
+        string notes;
+    }
 
-    /// @dev Auto-incrementing counter used to assign unique vehicle IDs.
-    uint256 private nextVehicleId;
+    // Mapping from VIN to Vehicle struct
+    mapping(string => Vehicle) private vehicles;
 
-    /**
-     * @dev Primary lookup: vehicleId → Vehicle struct.
-     *      Use this when you already know the vehicle ID.
-     */
-    mapping(uint256 => Vehicle) private vehicles;
+    // Mapping from VIN to list of ownership transfer records
+    mapping(string => TransferRecord[]) private ownershipHistory;
 
-    /**
-     * @dev Secondary lookup: vehicleNumber (plate) → vehicleId.
-     *      Lets the UI look up a vehicle by its plate number without
-     *      needing the internal numeric ID.
-     */
-    mapping(string => uint256) private vehicleNumberToId;
+    // Array of registered VINs for enumeration
+    string[] private allVins;
 
-    /**
-     * @dev Ownership history per vehicle.
-     *      vehicleId → array of OwnershipRecord (oldest first).
-     *      The first entry is always the original registrant.
-     */
-    mapping(uint256 => OwnershipRecord[]) private ownershipHistory;
-
-    // -------------------------------------------------------------------------
-    // EVENTS
-    // -------------------------------------------------------------------------
-
-    /**
-     * @dev Emitted when a new vehicle is registered on the blockchain.
-     * @param vehicleId      The unique ID assigned to this vehicle.
-     * @param vehicleNumber  The license/plate number.
-     * @param vehicleModel   Make and model string.
-     * @param owner          Wallet address of the registrant (first owner).
-     * @param timestamp      Block timestamp of registration.
-     */
+    // Events
     event VehicleRegistered(
-        uint256 indexed vehicleId,
-        string  vehicleNumber,
-        string  vehicleModel,
+        string indexed vin,
         address indexed owner,
+        string make,
+        string model,
+        uint256 year,
+        string licensePlate,
         uint256 timestamp
     );
 
-    /**
-     * @dev Emitted when ownership of a vehicle is transferred to a new wallet.
-     * @param vehicleId   The vehicle that changed hands.
-     * @param fromOwner   Previous owner's wallet address.
-     * @param toOwner     New owner's wallet address.
-     * @param timestamp   Block timestamp of the transfer.
-     */
     event OwnershipTransferred(
-        uint256 indexed vehicleId,
-        address indexed fromOwner,
-        address indexed toOwner,
-        uint256 timestamp
+        string indexed vin,
+        address indexed previousOwner,
+        address indexed newOwner,
+        uint256 timestamp,
+        string notes
     );
 
-    // -------------------------------------------------------------------------
-    // MODIFIERS
-    // -------------------------------------------------------------------------
+    // Modifiers
+    modifier onlyVehicleOwner(string memory vin) {
+        require(vehicles[vin].isRegistered, "Vehicle is not registered");
+        require(vehicles[vin].currentOwner == msg.sender, "Caller is not the current vehicle owner");
+        _;
+    }
 
-    /**
-     * @dev Reverts if the vehicle with the given ID does not exist.
-     *      Used to protect lookup and transfer functions.
-     */
-    modifier vehicleExists(uint256 vehicleId) {
-        require(vehicles[vehicleId].exists, "Vehicle does not exist");
+    modifier vehicleExists(string memory vin) {
+        require(vehicles[vin].isRegistered, "Vehicle does not exist in registry");
         _;
     }
 
     /**
-     * @dev Reverts if the caller is NOT the current owner of the vehicle.
-     *      Only the current owner can initiate a transfer.
-     */
-    modifier onlyCurrentOwner(uint256 vehicleId) {
-        require(
-            vehicles[vehicleId].currentOwner == msg.sender,
-            "Only the current owner can perform this action"
-        );
-        _;
-    }
-
-    // -------------------------------------------------------------------------
-    // CONSTRUCTOR
-    // -------------------------------------------------------------------------
-
-    constructor() {
-        // Vehicle IDs start at 1 so that ID 0 can serve as a "not found" sentinel
-        nextVehicleId = 1;
-    }
-
-    // -------------------------------------------------------------------------
-    // WRITE FUNCTIONS
-    // -------------------------------------------------------------------------
-
-    /**
-     * @notice Register a new vehicle on the blockchain.
-     * @dev    The caller (msg.sender) becomes the first owner.
-     *         Reverts if the vehicle number is already registered.
-     * @param vehicleNumber  License / plate number (must be unique).
-     * @param vehicleModel   Make and model description (e.g. "Honda Civic 2021").
-     * @return vehicleId     The unique ID assigned to the newly registered vehicle.
+     * @dev Register a new vehicle on the blockchain.
+     * @param vin Vehicle Identification Number (unique string)
+     * @param make Vehicle manufacturer/make
+     * @param model Vehicle model
+     * @param year Manufacturing year
+     * @param licensePlate Registration/License plate number
+     * @param ownerAddress Address of initial owner (defaults to msg.sender if address(0))
      */
     function registerVehicle(
-        string memory vehicleNumber,
-        string memory vehicleModel
-    ) external returns (uint256 vehicleId) {
-        // Basic input validation
-        require(bytes(vehicleNumber).length > 0, "Vehicle number cannot be empty");
-        require(bytes(vehicleModel).length  > 0, "Vehicle model cannot be empty");
+        string memory vin,
+        string memory make,
+        string memory model,
+        uint256 year,
+        string memory licensePlate,
+        address ownerAddress
+    ) public {
+        require(bytes(vin).length > 0, "VIN cannot be empty");
+        require(!vehicles[vin].isRegistered, "Vehicle with this VIN is already registered");
+        
+        address initialOwner = ownerAddress == address(0) ? msg.sender : ownerAddress;
+        require(initialOwner != address(0), "Invalid owner address");
 
-        // Prevent duplicate registrations using the same plate number
-        require(
-            vehicleNumberToId[vehicleNumber] == 0,
-            "Vehicle number is already registered"
-        );
-
-        vehicleId = nextVehicleId;
-        nextVehicleId++;
-
-        // Store vehicle data
-        vehicles[vehicleId] = Vehicle({
-            vehicleId:     vehicleId,
-            vehicleNumber: vehicleNumber,
-            vehicleModel:  vehicleModel,
-            currentOwner:  msg.sender,
-            registeredAt:  block.timestamp,
-            exists:        true
+        vehicles[vin] = Vehicle({
+            vin: vin,
+            make: make,
+            model: model,
+            year: year,
+            licensePlate: licensePlate,
+            currentOwner: initialOwner,
+            registrationTimestamp: block.timestamp,
+            isRegistered: true
         });
 
-        // Map plate number → ID for reverse lookup
-        vehicleNumberToId[vehicleNumber] = vehicleId;
+        allVins.push(vin);
 
-        // Record the first ownership entry in history
-        ownershipHistory[vehicleId].push(OwnershipRecord({
-            owner:     msg.sender,
-            timestamp: block.timestamp
+        // Record initial registration in history
+        ownershipHistory[vin].push(TransferRecord({
+            previousOwner: address(0),
+            newOwner: initialOwner,
+            timestamp: block.timestamp,
+            notes: "Initial Vehicle Registration"
         }));
 
         emit VehicleRegistered(
-            vehicleId,
-            vehicleNumber,
-            vehicleModel,
-            msg.sender,
+            vin,
+            initialOwner,
+            make,
+            model,
+            year,
+            licensePlate,
             block.timestamp
         );
     }
 
     /**
-     * @notice Transfer ownership of a vehicle to a new wallet address.
-     * @dev    Only the current owner can call this function.
-     *         Reverts if the new owner is the zero address or the same owner.
-     * @param vehicleId  The ID of the vehicle to transfer.
-     * @param newOwner   Wallet address of the new owner.
+     * @dev Transfer ownership of a registered vehicle to a new owner address.
+     * @param vin Vehicle Identification Number
+     * @param newOwner Address of the recipient/buyer
+     * @param notes Optional transfer notes or agreement reference
      */
     function transferOwnership(
-        uint256 vehicleId,
-        address newOwner
-    )
-        external
-        vehicleExists(vehicleId)
-        onlyCurrentOwner(vehicleId)
-    {
-        require(newOwner != address(0),          "New owner cannot be the zero address");
-        require(newOwner != msg.sender,           "New owner must be a different address");
+        string memory vin,
+        address newOwner,
+        string memory notes
+    ) public onlyVehicleOwner(vin) {
+        require(newOwner != address(0), "New owner address cannot be zero address");
+        require(newOwner != msg.sender, "New owner cannot be the current owner");
 
-        address previousOwner = vehicles[vehicleId].currentOwner;
+        address previousOwner = vehicles[vin].currentOwner;
+        vehicles[vin].currentOwner = newOwner;
 
-        // Update the current owner
-        vehicles[vehicleId].currentOwner = newOwner;
-
-        // Append the new owner to the history trail
-        ownershipHistory[vehicleId].push(OwnershipRecord({
-            owner:     newOwner,
-            timestamp: block.timestamp
+        ownershipHistory[vin].push(TransferRecord({
+            previousOwner: previousOwner,
+            newOwner: newOwner,
+            timestamp: block.timestamp,
+            notes: notes
         }));
 
         emit OwnershipTransferred(
-            vehicleId,
+            vin,
             previousOwner,
             newOwner,
-            block.timestamp
+            block.timestamp,
+            notes
         );
     }
 
-    // -------------------------------------------------------------------------
-    // READ FUNCTIONS (view — cost no gas when called externally)
-    // -------------------------------------------------------------------------
-
     /**
-     * @notice Retrieve all stored details for a vehicle by its numeric ID.
-     * @param vehicleId     The unique vehicle ID.
-     * @return id           The unique vehicle ID.
-     * @return vehicleNumber The license / plate number.
-     * @return vehicleModel  The make and model string.
-     * @return currentOwner  The current owner's wallet address.
-     * @return registeredAt  The block timestamp of registration.
+     * @dev Retrieve vehicle details by VIN.
+     * @param vin Vehicle Identification Number
      */
-    function getVehicleById(uint256 vehicleId)
-        external
+    function getVehicle(string memory vin)
+        public
         view
-        vehicleExists(vehicleId)
+        vehicleExists(vin)
         returns (
-            uint256 id,
-            string  memory vehicleNumber,
-            string  memory vehicleModel,
-            address currentOwner,
-            uint256 registeredAt
+            string memory,
+            string memory,
+            string memory,
+            uint256,
+            string memory,
+            address,
+            uint256,
+            bool
         )
     {
-        Vehicle storage v = vehicles[vehicleId];
+        Vehicle memory v = vehicles[vin];
         return (
-            v.vehicleId,
-            v.vehicleNumber,
-            v.vehicleModel,
+            v.vin,
+            v.make,
+            v.model,
+            v.year,
+            v.licensePlate,
             v.currentOwner,
-            v.registeredAt
+            v.registrationTimestamp,
+            v.isRegistered
         );
     }
 
     /**
-     * @notice Look up a vehicle using its license / plate number.
-     * @dev    Internally converts the plate to an ID and delegates to getVehicleById.
-     * @param vehicleNumber  The plate number string (case-sensitive).
-     * @return id            The unique vehicle ID.
-     * @return vNumber       The license / plate number.
-     * @return vehicleModel  The make and model string.
-     * @return currentOwner  The current owner's wallet address.
-     * @return registeredAt  The block timestamp of registration.
+     * @dev Check if a vehicle is registered by VIN.
+     * @param vin Vehicle Identification Number
      */
-    function getVehicleByNumber(string memory vehicleNumber)
-        external
-        view
-        returns (
-            uint256 id,
-            string  memory vNumber,
-            string  memory vehicleModel,
-            address currentOwner,
-            uint256 registeredAt
-        )
-    {
-        uint256 vehicleId = vehicleNumberToId[vehicleNumber];
-        require(vehicleId != 0, "Vehicle with this number not found");
-
-        Vehicle storage v = vehicles[vehicleId];
-        return (
-            v.vehicleId,
-            v.vehicleNumber,
-            v.vehicleModel,
-            v.currentOwner,
-            v.registeredAt
-        );
+    function isVehicleRegistered(string memory vin) public view returns (bool) {
+        return vehicles[vin].isRegistered;
     }
 
     /**
-     * @notice Get just the current owner's wallet address for a vehicle.
-     * @param vehicleId  The unique vehicle ID.
-     * @return           Current owner address.
+     * @dev Get complete ownership transfer history for a vehicle.
+     * @param vin Vehicle Identification Number
      */
-    function getCurrentOwner(uint256 vehicleId)
-        external
+    function getOwnershipHistory(string memory vin)
+        public
         view
-        vehicleExists(vehicleId)
-        returns (address)
+        vehicleExists(vin)
+        returns (TransferRecord[] memory)
     {
-        return vehicles[vehicleId].currentOwner;
+        return ownershipHistory[vin];
     }
 
     /**
-     * @notice Get the full ownership history trail for a vehicle.
-     * @dev    Returns an array of OwnershipRecord structs — oldest entry first.
-     *         The first record is always the original registrant.
-     * @param vehicleId  The unique vehicle ID.
-     * @return           Array of OwnershipRecord (owner address + timestamp).
+     * @dev Get total count of registered vehicles.
      */
-    function getOwnershipHistory(uint256 vehicleId)
-        external
-        view
-        vehicleExists(vehicleId)
-        returns (OwnershipRecord[] memory)
-    {
-        return ownershipHistory[vehicleId];
+    function getVehicleCount() public view returns (uint256) {
+        return allVins.length;
     }
 
     /**
-     * @notice Check if a vehicle number is already registered.
-     * @param vehicleNumber  The plate number to check.
-     * @return               True if registered, false otherwise.
+     * @dev Get list of all registered VINs.
      */
-    function isVehicleNumberRegistered(string memory vehicleNumber)
-        external
-        view
-        returns (bool)
-    {
-        return vehicleNumberToId[vehicleNumber] != 0;
-    }
-
-    /**
-     * @notice Returns the total number of vehicles registered so far.
-     * @return  Count of registered vehicles.
-     */
-    function getTotalVehicles() external view returns (uint256) {
-        // nextVehicleId starts at 1, so subtract 1 to get the actual count
-        return nextVehicleId - 1;
+    function getAllVins() public view returns (string[] memory) {
+        return allVins;
     }
 }
